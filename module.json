@@ -1,0 +1,26 @@
+{
+  "id": "livekit-animated-avatars",
+  "title": "LiveKit Animated Avatars",
+  "description": "Configure idle and talking images or videos for each user's Foundry audio/video portrait.",
+  "version": "0.1.0",
+  "authors": [
+    {
+      "name": "Ezyrider"
+    }
+  ],
+  "compatibility": {
+    "minimum": "14",
+    "maximum": "14"
+  },
+  "esmodules": [
+    "scripts/main.mjs"
+  ],
+  "relationships": {
+    "requires": [
+      {
+        "id": "avclient-livekit",
+        "type": "module"
+      }
+    ]
+  }
+}
