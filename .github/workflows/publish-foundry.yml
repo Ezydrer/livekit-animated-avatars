@@ -1,0 +1,128 @@
+name: Publish release to Foundry
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag, for example v0.1.0'
+        required: true
+        type: string
+      dry_run:
+        description: 'Validate only; do not publish to Foundry'
+        type: boolean
+        default: true
+      verified_core:
+        description: 'Tested Foundry version (only needed if absent from the release manifest)'
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: foundry-package-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Validate assets and register the release
+        env:
+          FOUNDRY_TOKEN: ${{ secrets.FOUNDRY_PACKAGE_RELEASE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
+          VERIFIED_CORE: ${{ inputs.verified_core }}
+        run: |
+          python3 - <<'PY'
+          import io
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import zipfile
+
+          package_id = "livekit-animated-avatars"
+          repo = os.environ["GITHUB_REPOSITORY"]
+          tag = os.environ["RELEASE_TAG"].strip()
+          dry_run = os.environ["DRY_RUN"] == "true"
+          token = os.environ["FOUNDRY_TOKEN"].strip()
+
+          def require(condition, message):
+              if not condition:
+                  raise SystemExit(message)
+
+          def fetch(url, headers=None):
+              request = urllib.request.Request(url, headers=headers or {})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return response.read()
+
+          require(token, "Add the FOUNDRY_PACKAGE_RELEASE_TOKEN repository secret.")
+          require(tag, "A release tag is required.")
+          api_url = f"https://api.github.com/repos/{repo}/releases/tags/{urllib.parse.quote(tag, safe='')}"
+          release = json.loads(fetch(api_url, {
+              "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+              "Accept": "application/vnd.github+json",
+              "User-Agent": "LiveKit-Animated-Avatars-Release"
+          }))
+          require(not release["draft"], "Publish the GitHub release before running this workflow.")
+          assets = {asset["name"]: asset["browser_download_url"] for asset in release["assets"]}
+          require("module.json" in assets and "module.zip" in assets,
+                  "Attach both module.json and module.zip to the release.")
+          manifest_url = assets["module.json"]
+          manifest = json.loads(fetch(manifest_url))
+          require(manifest.get("id") == package_id, "Unexpected module ID.")
+          version = manifest.get("version")
+          require(isinstance(version, str) and tag == "v" + version,
+                  "The release tag must be v followed by the module.json version.")
+          require(manifest.get("download") == assets["module.zip"],
+                  "The manifest download URL must match this release's module.zip asset.")
+
+          with zipfile.ZipFile(io.BytesIO(fetch(assets["module.zip"]))) as archive:
+              require("module.json" in archive.namelist(), "module.json must be at the ZIP root.")
+              require(json.loads(archive.read("module.json")) == manifest,
+                      "The ZIP manifest must match the separately uploaded module.json.")
+              require(all(path in archive.namelist() for path in manifest.get("esmodules", [])),
+                      "An esmodules script declared in the manifest is missing from the ZIP.")
+
+          compatibility = manifest.get("compatibility", {}).copy()
+          override = os.environ.get("VERIFIED_CORE", "").strip()
+          if override:
+              compatibility["verified"] = override
+          for field in ("minimum", "verified"):
+              require(compatibility.get(field),
+                      f"Missing compatibility.{field}. For this existing release, enter a tested version in Verified core; for future releases, add it to module.json.")
+          compatibility = {key: str(value) for key, value in compatibility.items()
+                           if key in ("minimum", "verified", "maximum") and value}
+          payload = {
+              "id": package_id,
+              "release": {
+                  "version": version,
+                  "manifest": manifest_url,
+                  "notes": release["html_url"],
+                  "compatibility": compatibility
+              }
+          }
+          if dry_run:
+              payload["dry-run"] = True
+          print("Validating only" if dry_run else "Registering release with Foundry")
+          print(json.dumps(payload, indent=2))
+          request = urllib.request.Request(
+              "https://foundryvtt.com/_api/packages/release_version/",
+              data=json.dumps(payload).encode(), method="POST",
+              headers={"Authorization": token, "Content-Type": "application/json"}
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  result = json.loads(response.read())
+          except urllib.error.HTTPError as error:
+              detail = error.read().decode(errors="replace").replace(token, "[REDACTED]")
+              raise SystemExit(f"Foundry returned HTTP {error.code}: {detail}")
+          require(result.get("status") == "success", "Foundry did not report success.")
+          print(json.dumps(result).replace(token, "[REDACTED]"))
+          PY
